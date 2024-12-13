@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter
 from fastapi.middleware.gzip import GZipMiddleware
 from cachetools import TTLCache
 from kafka import KafkaProducer
@@ -12,9 +12,27 @@ import asyncio
 import json
 import time
 import os
+from contextlib import asynccontextmanager
+from shared.base_service import BaseService
+from circuitbreaker import circuit
+import uuid
 
 load_dotenv()
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app.state.kafka_producer = await init_kafka()
+    logger.info("Kafka producer initialized")
+    yield
+    # Shutdown
+    if hasattr(app.state, 'kafka_producer'):
+        app.state.kafka_producer.close()
+        logger.info("Kafka producer closed")
+
+service = BaseService("text_summarizer")
+app = service.app
+app.lifespan = lifespan  # Set lifespan for the service app
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +46,14 @@ class SummaryRequest(BaseModel):
     style: str = "formal"
     max_length: int = 500
     bullet_points: bool = False
+
+class SummaryStatus(BaseModel):
+    id: str
+    status: str
+    result: dict = None
+    error: str = None
+
+summary_status = {}
 
 STYLE_PROMPTS = {
     "formal": """I will now provide a formal academic summary:
@@ -76,25 +102,27 @@ Craft an engaging narrative summary that:
 - Maintains reader engagement through varied language"""
 }
 
+@circuit(failure_threshold=5, recovery_timeout=60)
 def generate_completion(prompt: str) -> str:
-    try:
-        client = ollama.Client(host=os.getenv('OLLAMA_API_URL', 'http://ollama:11434'))
-        response = client.generate(
-            model=os.getenv('MODEL_NAME', 'llama3.1:3b'),
-            prompt=prompt,
-            options={
-                'temperature': 0.7,
-                'top_p': 0.9,
-                'num_ctx': 4096,
-                'num_predict': 2048,
-                'num_gpu': int(os.getenv('NUM_GPU', 1)),
-                'num_thread': int(os.getenv('NUM_THREAD', 4))
-            }
-        )
-        return response['response']
-    except Exception as e:
-        logger.error(f"Ollama generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    with service.request_latency.time():
+        try:
+            client = ollama.Client(host=os.getenv('OLLAMA_API_URL', 'http://ollama:11434'))
+            response = client.generate(
+                model=os.getenv('MODEL_NAME', 'llama3.1:3b'),
+                prompt=prompt,
+                options={
+                    'temperature': 0.7,
+                    'top_p': 0.9,
+                    'num_ctx': 4096,
+                    'num_predict': 2048,
+                    'num_gpu': int(os.getenv('NUM_GPU', 1)),
+                    'num_thread': int(os.getenv('NUM_THREAD', 4))
+                }
+            )
+            return response['response']
+        except Exception as e:
+            logger.error(f"Circuit breaker: {str(e)}")
+            raise
 
 async def init_kafka():
     try:
@@ -112,68 +140,52 @@ async def send_to_kafka(producer, message):
     if not producer:
         return
     try:
-        future = producer.send('summarization_requests', message)
+        future = producer.send('summarizer_requests', message)  # Changed topic name
         await asyncio.get_event_loop().run_in_executor(None, future.get, 60)
     except Exception as e:
         logger.error(f"Kafka send error: {e}")
 
-@app.post("/summarize")
+api_router = APIRouter(prefix="/api/v1")
+
+@api_router.post("/summarize")
 async def summarize_text(request: SummaryRequest, background_tasks: BackgroundTasks):
-    cache_key = hashlib.md5(f"{request.text}{request.style}{request.max_length}{request.bullet_points}".encode()).hexdigest()
+    request_id = str(uuid.uuid4())
+    summary_status[request_id] = {"status": "processing"}
     
-    if cache_key in summary_cache:
-        return summary_cache[cache_key]
+    try:
+        service.request_count.inc()
+        cache_key = hashlib.md5(f"{request.text}{request.style}{request.max_length}{request.bullet_points}".encode()).hexdigest()
+        
+        if cache_key in summary_cache:
+            result = summary_cache[cache_key]
+            summary_status[request_id] = {"status": "completed", "result": result}
+            return {"id": request_id, "status": "completed", "result": result}
+        
+        background_tasks.add_task(process_summary, request, request_id, cache_key)
+        return {"id": request_id, "status": "processing"}
+        
+    except Exception as e:
+        summary_status[request_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/summarize/status/{request_id}")
+async def get_summary_status(request_id: str):
+    if request_id not in summary_status:
+        raise HTTPException(status_code=404, detail="Summary request not found")
     
-    prompt = f"""{STYLE_PROMPTS.get(request.style, STYLE_PROMPTS["formal"])}
+    return summary_status[request_id]
 
-Please start your response by stating "Here is a {request.max_length}-word summary:"
-
-Critical Instructions:
-- Only use information explicitly stated in the provided text
-- Do not add any external information or assumptions
-- Do not make inferences beyond what is directly supported by the text
-- Maintain factual accuracy without embellishment
-- Stick strictly to the content provided
-
-Guidelines:
-- Maximum length: {request.max_length} words
-- Format: {"bullet points" if request.bullet_points else "paragraph"}
-- Preserve critical information
-- Remove redundancy
-
-Text to summarize:
-{request.text}"""
-    
-    summary = generate_completion(prompt)
-    result = {"summary": summary, "style": request.style}
-    summary_cache[cache_key] = result
-    
-    # Send to Kafka in background
-    if hasattr(app.state, 'kafka_producer'):
-        background_tasks.add_task(
-            send_to_kafka,
-            app.state.kafka_producer,
-            {
-                'text': request.text,
-                'style': request.style,
-                'timestamp': time.time(),
-                'cache_key': cache_key
-            }
-        )
-    
-    return result
-
-@app.on_event("startup")
-async def startup_event():
-    app.state.kafka_producer = await init_kafka()
-    logger.info("Kafka producer initialized")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if hasattr(app.state, 'kafka_producer'):
-        app.state.kafka_producer.close()
-        logger.info("Kafka producer closed")
+app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import multiprocessing
+    
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,  # Disable reload in production
+        workers=multiprocessing.cpu_count(),
+        log_level="info"
+    )
