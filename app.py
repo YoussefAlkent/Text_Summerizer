@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter
 from fastapi.middleware.gzip import GZipMiddleware
 from cachetools import TTLCache
 from kafka import KafkaProducer
@@ -12,9 +12,26 @@ import asyncio
 import json
 import time
 import os
+from contextlib import asynccontextmanager
+from shared.base_service import BaseService
+from circuitbreaker import circuit
 
 load_dotenv()
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    app.state.kafka_producer = await init_kafka()
+    logger.info("Kafka producer initialized")
+    yield
+    # Shutdown
+    if hasattr(app.state, 'kafka_producer'):
+        app.state.kafka_producer.close()
+        logger.info("Kafka producer closed")
+
+service = BaseService("text_summarizer")
+app = service.app
+app.lifespan = lifespan  # Set lifespan for the service app
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 logging.basicConfig(level=logging.INFO)
@@ -76,25 +93,27 @@ Craft an engaging narrative summary that:
 - Maintains reader engagement through varied language"""
 }
 
+@circuit(failure_threshold=5, recovery_timeout=60)
 def generate_completion(prompt: str) -> str:
-    try:
-        client = ollama.Client(host=os.getenv('OLLAMA_API_URL', 'http://ollama:11434'))
-        response = client.generate(
-            model=os.getenv('MODEL_NAME', 'llama3.1:3b'),
-            prompt=prompt,
-            options={
-                'temperature': 0.7,
-                'top_p': 0.9,
-                'num_ctx': 4096,
-                'num_predict': 2048,
-                'num_gpu': int(os.getenv('NUM_GPU', 1)),
-                'num_thread': int(os.getenv('NUM_THREAD', 4))
-            }
-        )
-        return response['response']
-    except Exception as e:
-        logger.error(f"Ollama generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+    with service.request_latency.time():
+        try:
+            client = ollama.Client(host=os.getenv('OLLAMA_API_URL', 'http://ollama:11434'))
+            response = client.generate(
+                model=os.getenv('MODEL_NAME', 'llama3.1:3b'),
+                prompt=prompt,
+                options={
+                    'temperature': 0.7,
+                    'top_p': 0.9,
+                    'num_ctx': 4096,
+                    'num_predict': 2048,
+                    'num_gpu': int(os.getenv('NUM_GPU', 1)),
+                    'num_thread': int(os.getenv('NUM_THREAD', 4))
+                }
+            )
+            return response['response']
+        except Exception as e:
+            logger.error(f"Circuit breaker: {str(e)}")
+            raise
 
 async def init_kafka():
     try:
@@ -112,13 +131,16 @@ async def send_to_kafka(producer, message):
     if not producer:
         return
     try:
-        future = producer.send('summarization_requests', message)
+        future = producer.send('summarizer_requests', message)  # Changed topic name
         await asyncio.get_event_loop().run_in_executor(None, future.get, 60)
     except Exception as e:
         logger.error(f"Kafka send error: {e}")
 
-@app.post("/summarize")
+api_router = APIRouter(prefix="/api/v1")
+
+@api_router.post("/summarize")
 async def summarize_text(request: SummaryRequest, background_tasks: BackgroundTasks):
+    service.request_count.inc()
     cache_key = hashlib.md5(f"{request.text}{request.style}{request.max_length}{request.bullet_points}".encode()).hexdigest()
     
     if cache_key in summary_cache:
@@ -163,17 +185,17 @@ Text to summarize:
     
     return result
 
-@app.on_event("startup")
-async def startup_event():
-    app.state.kafka_producer = await init_kafka()
-    logger.info("Kafka producer initialized")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if hasattr(app.state, 'kafka_producer'):
-        app.state.kafka_producer.close()
-        logger.info("Kafka producer closed")
+app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import multiprocessing
+    
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,  # Disable reload in production
+        workers=multiprocessing.cpu_count(),
+        log_level="info"
+    )
