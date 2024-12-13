@@ -1,6 +1,6 @@
 # English Text Summarization Microservice
 
-A high-performance microservice that leverages AI models through Groq to provide intelligent text summarization capabilities. The service is containerized and designed to work within a microservices architecture, supporting both REST API and Kafka-based communication.
+A high-performance microservice that leverages AI models through ollama to provide intelligent text summarization capabilities. The service is containerized and designed to work within a microservices architecture, supporting both REST API and Kafka-based communication.
 
 ## Features
 
@@ -28,7 +28,7 @@ A high-performance microservice that leverages AI models through Groq to provide
 - **Kafka Integration**: Event-driven architecture support
 - **Docker Containerization**: Easy deployment and scaling
 - **Caching Layer**: TTL-based caching for improved performance
-- **AI Model**: Groq-hosted Llama model
+- **AI Model**: ollama-hosted Llama model
 
 ### System Requirements
 - Python 3.9+
@@ -107,7 +107,7 @@ Topics:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| OLLAMA_API_URL | Groq API endpoint | http://ollama:11434 |
+| OLLAMA_API_URL | ollama API endpoint | http://ollama:11434 |
 | MODEL_NAME | AI model to use | llama3.2:3b |
 | KAFKA_BOOTSTRAP_SERVERS | Kafka servers | kafka:9092 |
 | WORKERS | Number of worker processes | 4 |
