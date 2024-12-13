@@ -15,6 +15,7 @@ import os
 from contextlib import asynccontextmanager
 from shared.base_service import BaseService
 from circuitbreaker import circuit
+import uuid
 
 load_dotenv()
 
@@ -45,6 +46,14 @@ class SummaryRequest(BaseModel):
     style: str = "formal"
     max_length: int = 500
     bullet_points: bool = False
+
+class SummaryStatus(BaseModel):
+    id: str
+    status: str
+    result: dict = None
+    error: str = None
+
+summary_status = {}
 
 STYLE_PROMPTS = {
     "formal": """I will now provide a formal academic summary:
@@ -140,50 +149,31 @@ api_router = APIRouter(prefix="/api/v1")
 
 @api_router.post("/summarize")
 async def summarize_text(request: SummaryRequest, background_tasks: BackgroundTasks):
-    service.request_count.inc()
-    cache_key = hashlib.md5(f"{request.text}{request.style}{request.max_length}{request.bullet_points}".encode()).hexdigest()
+    request_id = str(uuid.uuid4())
+    summary_status[request_id] = {"status": "processing"}
     
-    if cache_key in summary_cache:
-        return summary_cache[cache_key]
-    
-    prompt = f"""{STYLE_PROMPTS.get(request.style, STYLE_PROMPTS["formal"])}
+    try:
+        service.request_count.inc()
+        cache_key = hashlib.md5(f"{request.text}{request.style}{request.max_length}{request.bullet_points}".encode()).hexdigest()
+        
+        if cache_key in summary_cache:
+            result = summary_cache[cache_key]
+            summary_status[request_id] = {"status": "completed", "result": result}
+            return {"id": request_id, "status": "completed", "result": result}
+        
+        background_tasks.add_task(process_summary, request, request_id, cache_key)
+        return {"id": request_id, "status": "processing"}
+        
+    except Exception as e:
+        summary_status[request_id] = {"status": "error", "error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
-Please start your response by stating "Here is a {request.max_length}-word summary:"
-
-Critical Instructions:
-- Only use information explicitly stated in the provided text
-- Do not add any external information or assumptions
-- Do not make inferences beyond what is directly supported by the text
-- Maintain factual accuracy without embellishment
-- Stick strictly to the content provided
-
-Guidelines:
-- Maximum length: {request.max_length} words
-- Format: {"bullet points" if request.bullet_points else "paragraph"}
-- Preserve critical information
-- Remove redundancy
-
-Text to summarize:
-{request.text}"""
+@api_router.get("/summarize/status/{request_id}")
+async def get_summary_status(request_id: str):
+    if request_id not in summary_status:
+        raise HTTPException(status_code=404, detail="Summary request not found")
     
-    summary = generate_completion(prompt)
-    result = {"summary": summary, "style": request.style}
-    summary_cache[cache_key] = result
-    
-    # Send to Kafka in background
-    if hasattr(app.state, 'kafka_producer'):
-        background_tasks.add_task(
-            send_to_kafka,
-            app.state.kafka_producer,
-            {
-                'text': request.text,
-                'style': request.style,
-                'timestamp': time.time(),
-                'cache_key': cache_key
-            }
-        )
-    
-    return result
+    return summary_status[request_id]
 
 app.include_router(api_router)
 
