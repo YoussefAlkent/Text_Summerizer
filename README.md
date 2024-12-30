@@ -2,6 +2,7 @@
 
 A high-performance microservice that leverages AI models through ollama to provide intelligent text summarization capabilities. The service is containerized and designed to work within a microservices architecture, supporting both REST API and Kafka-based communication.
 
+
 ## Features
 
 - **Advanced Text Summarization**: Utilizes state-of-the-art AI models for accurate and contextual text summarization
