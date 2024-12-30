@@ -2,16 +2,19 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Upgrade pip and install dependencies
-RUN pip install --upgrade pip==24.3.1
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Add pip configuration for faster installs
+RUN pip config set global.index-url https://pypi.org/simple/ \
+    && pip config set global.trusted-host pypi.org \
+    && pip install --upgrade pip
 
-# Copy application code
-COPY . .
+# Copy shared module first
+COPY shared/ /app/shared/
 
-# Set environment variables
+# Copy only requirements first for better caching
+COPY Text_Summerizer/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt --compile
+
+COPY Text_Summerizer/ .
 ENV PYTHONUNBUFFERED=1
 
-# Run the application
 CMD ["python", "app.py"]
