@@ -43,6 +43,7 @@ A high-performance microservice that leverages AI models through ollama to provi
    git clone https://github.com/YoussefAlkent Text_Summerizer.git
    cd text-summarizer
    ```
+   
 2. **Environment Setup**
    ```bash
    # Create and edit .env file
