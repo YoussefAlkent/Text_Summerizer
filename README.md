@@ -38,6 +38,7 @@ A high-performance microservice that leverages AI models through ollama to provi
 - 4GB RAM minimum
 - 2 CPU cores minimum
 
+
 ## Quick Start
 
 1. **Clone the Repository**
