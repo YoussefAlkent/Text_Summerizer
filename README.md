@@ -29,6 +29,7 @@ A high-performance microservice that leverages AI models through ollama to provi
 - **Docker Containerization**: Easy deployment and scaling
 - **Caching Layer**: TTL-based caching for improved performance
 - **AI Model**: ollama-hosted Llama model
+- **Transformers Model**: Using a model from HuggingFace
 
 ### System Requirements
 - Python 3.9+
